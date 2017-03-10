@@ -493,7 +493,7 @@ shinyServer(
 
     ####### affichage des paramètres de lissage utilisés #######
     observeEvent(input$carteAffichee, {
-      cat("############ retour du serveur via javascript ############")
+           cat("############ retour du serveur via javascript ############")
       if ( is.null(input$selectVar) )
         return(NULL)
       progress$set(value = 0, detail = pbDetailParDefaut)
