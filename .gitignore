@@ -1,0 +1,11 @@
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+packages
+logs
+packagesZip
+save
+server.R.bak
+svn
+test
