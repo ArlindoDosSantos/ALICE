@@ -1,27 +1,30 @@
-options(shiny.maxRequestSize = 10 * 1024 ^ 2) # taille maximum pour le upload des fichiers fond de carte (10 Mo)
 options(encoding = "UTF-8")
+options(shiny.maxRequestSize = 1 * 1024 ^ 2) # taille maximum pour le upload des fichiers fond de carte (1 Mo)
 options(shiny.trace = FALSE)
 options(shiny.reactlog = FALSE)
-########################################################################################################################
+source("utils.R")
+
+#### Application ALICE (Application web de LIssage CartographiquE) - permet d'appeler le package de carroyage/lissage "btb"
 #
 # date        version         auteur                    commentaire
 # 2016/10/27  0.0.1      Arlindo Dos Santos
+# 2017/05/19  0.0.2      Arlindo Dos Santos
 # 
 # RG 00: Toujours travailler en local avec une version de R identique à celle de REC et Prod afin de se prémunir de problèmes de compatibilité de versions de packages
-# RG 01: Le fichier .DB doit comporter une seule table ayant le même nom que son fichier .DB => RG obsolete ?
-# RG 02: Le fichier .DB comporte des coordonnées en Lambert 93  => RG obsolete ?
-# RG 03: Le fichier .DB comporte une colonne nbObsLisse à 1 pour toutes les observations
-# RG 04: Les carreaux ayant moins de NB_OBS_MIN observations ne sont pas affichés ni exportées (secret statistique)
-# RG 05: les variables contenant au moins un NA dans leur modalité sont supprimées
-# RG 06: les variables non numériques sont supprimées
-# RG 07: Le nom du répertoire contenant les sources de données doit être identique au nom 
-# RG 08: Seules les données qui ont un nbObsLisse > NB_OBS_MIN sont exportées
-# RG 09: Seules les données qui ont un nbObsLisse > NB_OBS_MIN et les NB_MAX_CARREAUX carreaux ayant le plus grand nbObsLisse sont affichées
-# RG 10: Les valeurs des categories sont arondies à l'unité; il faut donc multiplier les pourcentatges pour les mettre sur base 100
-# RG 11: Catégorisation k-means pour des questions de performance
-# RG 12: taille maximale du fichier fond de carte uploadé: 10 Mo
-# RG 13: s'il y a des suppressions de colonnes à effectuer, elles seront déclarées dans le traitement post lissage
-########################################################################################################################
+# RG 01: Le fichier .DB doit comporter une seule table
+# RG 02: Le fichier .DB doit comporter des coordonnées en Lambert 93  => RG obsolete ?
+# RG 03: Le fichier .DB doit comporter une colonne nbObsLisse à 1 pour toutes les observations
+# RG 04: Les carreaux ayant moins de NB_OBS_MIN observations ne sont ni affichés ni exportés (secret statistique)
+# RG 05: Seules les carreaux ayant un nbObsLisse > NB_OBS_MIN et les NB_MAX_CARREAUX carreaux ayant le plus grand nbObsLisse sont affichés
+# RG 06: Les variables contenant au moins un NA dans leur modalité sont supprimées
+# RG 07: Les variables non numériques sont supprimées
+# RG 08: Le nom du répertoire contenant les sources de données doit être identique au nom  => RG obsolete ?
+# RG 09: Les valeurs des categories sont arondies à l'unité; il faut donc multiplier les pourcentatges pour les mettre sur base 100
+# RG 10: Catégorisation k-means pour des questions de performance
+# RG 11: Taille maximale du fichier fond de carte uploadé: 10 Mo (estimation empirique)
+# RG 12: S'il y a des suppressions de colonnes à effectuer, elles seront déclarées dans le traitement post lissage
+# RG 13: Ne pas utiliser de cat; lui préférer l'appel à la fonction trace définie dans utils.R
+####
 
 WINDOWS <- "windows"
 platformOS <- .Platform$OS.type
@@ -39,7 +42,6 @@ library(shiny, lib.loc = bibliotheque, warn.conflicts = FALSE, quietly = TRUE, v
 library(DBI, lib.loc = bibliotheque, warn.conflicts = FALSE, quietly = TRUE, verbose = FALSE)
 library(RSQLite, lib.loc = bibliotheque, warn.conflicts = FALSE, quietly = TRUE, verbose = FALSE)
 library(cartography, lib.loc = bibliotheque, warn.conflicts = FALSE, quietly = TRUE, verbose = FALSE)
-library(log4r, lib.loc = bibliotheque, warn.conflicts = FALSE, quietly = TRUE, verbose = FALSE)
 library(rgdal, lib.loc = bibliotheque, warn.conflicts = FALSE, quietly = TRUE, verbose = FALSE)
 library(sp, lib.loc = bibliotheque, warn.conflicts = FALSE, quietly = TRUE, verbose = FALSE)
 library(scales, lib.loc = bibliotheque, warn.conflicts = FALSE, quietly = TRUE, verbose = FALSE)
@@ -48,10 +50,8 @@ library(DT, lib.loc = bibliotheque, warn.conflicts = FALSE, quietly = TRUE, verb
 library(classInt, lib.loc = bibliotheque, warn.conflicts = FALSE, quietly = TRUE, verbose = FALSE)
 library(btb, lib.loc = bibliotheque, warn.conflicts = FALSE, quietly = TRUE, verbose = FALSE)
 
-logger <- log4r::create.logger()
-
 urlFondDeCarte <- 'http://{s}.tile.openstreetmap.fr/osmfr/{z}/{x}/{y}.png'
-cheminBasesDonnees <- "D:/bases/"
+cheminBasesDonnees <- "D:/S3QCEA/bases/"
 
 coucheQPVMetropole <- NULL
 
@@ -61,71 +61,44 @@ pbDetailParDefaut <- "aucun"
 nomFichierConfSource <- "sources.properties"
 ##################### fonctions commune à toutes les sessions ##########################################################
 
-# fct permettant de lire un couple cle-valeur dans un fichier property
-# inspiré de properties::read.properties mais modifié pour nos besoins 
-fctReadProperty <- function(file, fields = NULL, encoding = "UTF-8") 
-{
-  if (is.character(file)) {
-    file <- file(file, "r", encoding = encoding)
-    on.exit(close(file))
-  }
-  
-  if (!inherits(file, "connection")) 
-    stop("'file' must be a character string or connection")
-  
-  lines <- readLines(file)
-  commentedLines <- grepl("^#.*$", lines)
-  lines <- lines[!commentedLines]
-  line_is_not_empty <- !grepl("^[[:space:]]*$", lines)
-  lines <- lines[line_is_not_empty]
-  line_has_tag <- grepl("^[^[:blank:]][^=:]*:=", lines)
-  
-  tuples <- c()
-  for (i in length(lines):1 )
-  {
-    if (!line_has_tag[i])
-      lines[i - 1] <- paste0(lines[i - 1], ";", lines[i]) # le tuple se poursuit sur plusieurs lignes
-    else
-      tuples <- c(lines[i], tuples)
-  }
-  
-  keys <- gsub("^([^:=]+):=.*$", "\\1", tuples)
-  values <- gsub("^[^:=]+:=(.*)$", "\\1", tuples)
-  names(values) <- keys
-  out <- as.list(values)
-  
-  out <- if (!is.null(fields)) 
-    out[fields]
-  else out
-  return(out)
-}
-
 contextualisation <- function()
 {
   if (platformOS == WINDOWS)
   {
     # ceci n'est pas à faire sur les env de recette et prod car la commande zip existe par défaut sur ces environnements
-    Sys.setenv(R_ZIPCMD = "D:/Program_Files/Rtools/bin/zip")
+    Sys.setenv(R_ZIPCMD = "D:/S3QCEA/Program_Files/Rtools/bin/zip")
     
     # stop en debug en cas d'erreur
     options(shiny.error = browser)
     
-    setwd("D:/programmation/R/ALICE") # local (debug)
+    setwd("D:/S3QCEA/programmation/R/ALICE") # local (debug)
 
     # output back to the console
-    # sink(type = "message")
-    # sink()
+    sink(type = "message")
+    sink()
+  
+    # # output to a file
+    # dateHeure <- substr(x = Sys.time(), start = 1, stop = 19)
+    # dateHeure <- Sys.Date()
+    # dateHeure <- gsub(pattern = ":", replacement = "_", x = dateHeure)
+    # dateHeure <- gsub(pattern = " ", replacement = "_", x = dateHeure)
+    # newStdout <- file(paste0(getwd(), "/logs/server_", dateHeure, ".log"), open = "a", encoding = "UTF-8", blocking = FALSE)
+    # sink(newStdout)
+    # sink(newStdout, type = "message", append = TRUE)
   }
   else
   {
     cheminBasesDonnees <<- paste0(getwd(), "/bases")
 
     # output to a file
-    newStdout <- file(paste0(getwd(), "/logs/server.log"), open = "wt")
+    dateHeure <- substr(x = Sys.time(), start = 1, stop = 19)
+    dateHeure <- Sys.Date()
+    dateHeure <- gsub(pattern = ":", replacement = "_", x = dateHeure)
+    dateHeure <- gsub(pattern = " ", replacement = "_", x = dateHeure)
+    newStdout <- file(paste0(getwd(), "/logs/server_", dateHeure, ".log"), open = "a", encoding = "UTF-8", blocking = FALSE)
     sink(newStdout)
-    sink(newStdout, type = c("output", "message"), split = TRUE)
+    sink(newStdout, type = "message", append = TRUE)
   }
-
   cheminFichierQPV <- paste0(getwd(), "/QPV/QPV.shp")
   coucheQPVMetropole <<- readOGR(cheminFichierQPV, "QPV")
   coucheQPVMetropole <<- spTransform(coucheQPVMetropole, CRS = CRS("+init=epsg:4326")) # transformation en WGS84 pour le leaflet
@@ -135,10 +108,7 @@ contextualisation <- function()
   MAX_RAYON <<- as.numeric(fctReadProperty(serverPropertyFileName, fields = c("MAX_RAYON"))[[1]])
   RAYON_INITIAL <<- as.numeric(fctReadProperty(serverPropertyFileName, fields = c("RAYON_INITIAL"))[[1]])
   NB_OBS_MIN <<- as.numeric(fctReadProperty(serverPropertyFileName, fields = c("NB_OBS_MIN"))[[1]])
-  logLevel <- fctReadProperty(serverPropertyFileName, fields = c("log4R.level"))
-  
-  log4r::logfile(logger) <<- paste0(getwd(), "/logs/server.log")
-  log4r::level(logger) <<- logLevel[[1]]
+  traceLevel <<- fctReadProperty(serverPropertyFileName, fields = c("trace.level"))
   
   # calculer les centroides de toutes les zones
   epsgPivot <<- as.numeric(fctReadProperty(serverPropertyFileName, fields = c("epsgPivot"))[[1]])
@@ -155,12 +125,83 @@ contextualisation <- function()
   vCentroideZones <<- mapply(rgeos::gCentroid, vCouches)
 }
 
+getListUsersAutorises <- function()
+{
+  propertyFileName <- paste0(getwd(), "/properties/authentification.properties")
+  fctReadProperty(propertyFileName)
+}
+
 contextualisation()
+listeUsersAutorises <<- getListUsersAutorises()
 
 ####################### fonctions propre à chaque session ##############################################################
 shinyServer(
   function(input, output, session)
   {
+    # vérification de l'autorisation d'accès
+    output$autorisation <- eventReactive(input$btnConnexion, {
+      if (toupper(input$login) %in% toupper(names(listeUsersAutorises)))
+      {
+        index <- which(toupper(names(listeUsersAutorises)) == toupper(input$login))
+        
+        nom <- strsplit(x = listeUsersAutorises[[index]], split = ";")[[1]][1]
+        motDePasseAttendu <- strsplit(x = listeUsersAutorises[[index]], split = ";")[[1]][2]
+
+        if (input$password == motDePasseAttendu)
+        {
+          trace(traceLevel, "autorisation TRUE", "DEBUG")
+          output$nomUser <- renderUI({div(nom, style = "font-weight: bold")})
+          "TRUE"
+        }else{
+          trace(traceLevel, "autorisation FALSE", "DEBUG")
+          output$messageConnexion <- renderText({"mot de passe incorrect"})
+          "FALSE"
+        }
+      }
+      else{
+        trace(traceLevel, "autorisation FALSE", "DEBUG")
+        output$messageConnexion <- renderText({"login inconnu"})
+        "FALSE"
+      }
+    })
+    outputOptions(output, "autorisation", suspendWhenHidden = FALSE) # pour forcer l'évaluation de la variable autorisation
+    
+    # affichage du menu des libellés des variables
+    output$menuVariables <- DT::renderDataTable({
+
+      propertyFileName <- paste0(getwd(), "/properties/sources.properties")
+      iNbSources <- fctReadProperty(propertyFileName, "nbSources")[[1]]
+
+      dfToutesSources <- data.frame(source = c(), variable = c(), descriptif = c(), stringsAsFactors = FALSE)
+
+      for (iSource in 1:iNbSources)
+      {
+        nomSource <- fctReadProperty(propertyFileName, paste0("source.", iSource))[[1]]
+        lLibelles <- fctReadProperty(propertyFileName, paste0(nomSource, ".variables"))[[1]]
+        lLibelles <- gsub(pattern = "\t", replacement = "", x = lLibelles)
+        vCleLibelles <- strsplit(x = lLibelles, split = ";")[[1]]
+
+        vVariable <- unlist(lapply(1:length(vCleLibelles), function(i) {
+          return(strsplit(x = vCleLibelles[[i]], split = "=>")[[1]][1])
+        }))
+
+        vDiffusible <- unlist(lapply(1:length(vCleLibelles), function(i) {
+          return(strsplit(x = vCleLibelles[[i]], split = "=>")[[1]][2])
+        }))
+        
+        vDescriptif <- unlist(lapply(1:length(vCleLibelles), function(i) {
+          return(strsplit(x = vCleLibelles[[i]], split = "=>")[[1]][3])
+        }))
+        
+        df <- data.frame(source = nomSource, variable = vVariable, diffusible = vDiffusible, descriptif = vDescriptif, stringsAsFactors = FALSE)
+
+        dfToutesSources <- rbind(dfToutesSources, df)
+      }
+
+      DT::datatable(dfToutesSources)
+    })
+    
+    # affichage du menu "version de R"
     output$versionDeR <- renderUI({
       message <- paste0("<tr>", "<td>", names(R.version), ": </td><td><b>", R.version, "</b></td></tr>")
       message <- toString(message)
@@ -188,17 +229,20 @@ shinyServer(
       }
       else if (value >= 99)
       {
+        trace(traceLevel, message, "INFO")
         progress$set(value = 0, detail = message)
       }
       else
       {
+        trace(traceLevel, message, "DEBUG")
         progress$set(value = (value / 100), detail = message)
       }
     }
     
     ####### affichage des packages chargés en mémoire #######
     output$tableDesPackages <- DT::renderDataTable({
-      cat("\n ############ affichage des packages chargés en mémoire ############\n")
+      trace(traceLevel, "############ affichage des packages chargés en mémoire ############", "DEBUG")
+      
       listePackages <- search()
       listePackages <- listePackages[listePackages != "Autoloads"]
       listePackages <- listePackages[listePackages != "tools:rstudio"]
@@ -230,25 +274,26 @@ shinyServer(
     })
     
     ####### affichage du curseur pour le rayon de lissage #######
-    output$outputSliderRayon <- renderUI({
-      cat("\n ############ affichage du curseur pour le rayon de lissage ############\n")
+    observe({
+      # utiliser le update plutôt que de refaire à chaque fois le slider permet d'éviter l'oscillation du slider
       if (is.null(input$sliderRayon))
         rayonCourant <- RAYON_INITIAL
       else if (input$sliderRayon < updateRayonMin())
         rayonCourant <- updateRayonMin()
       else if (input$sliderRayon > updateRayonMax())
         rayonCourant <- updateRayonMax()
-      else 
+      else
         rayonCourant <- input$sliderRayon
-
+      
       min <- updateRayonMin() + 50 - updateRayonMin() %% 50
-      sliderInput("sliderRayon", "Rayon de lissage (en mètres) :", min = min, max = updateRayonMax(), value = rayonCourant, step = 50)
+      updateSliderInput(session, "sliderRayon", value = rayonCourant, min = min, max = updateRayonMax(), step = 50)
     })
 
     ####### affichage du sélecteur de base de donnée #######
     observeEvent(input$inputFiles,
      {
-       cat("\n ############ affichage du sélecteur de base de donnée ############\n")
+       trace(traceLevel, "############ affichage du sélecteur de base de donnée ############", "DEBUG")
+
        # TODO: vérifier la présence des 4 fichiers
        output$inputDatas <- renderUI(
          {
@@ -267,7 +312,7 @@ shinyServer(
     ####### sélection du territoire étudié #######
     territoire <- eventReactive(input$inputFiles, 
      {
-       cat("\n ############ sélection du territoire étudié ############\n")
+       trace(traceLevel, "############ sélection du territoire étudié ############", "DEBUG")
         dir <- dirname(input$inputFiles[1, 4])   # pour récuperer le shp
         for (i in 1:nrow(input$inputFiles))      # on renomme les fichiers dans le répertoire temporaire du serveur
           file.rename(input$inputFiles[i, 4], paste0(dir, "/", input$inputFiles[i, 1]))
@@ -277,6 +322,7 @@ shinyServer(
         
         shape <- readOGR(shpFilename, nomCouche)
         shape <- sp::spTransform(shape, CRSobj = CRS(paste0("+init=epsg:", epsgPivot)))
+        
         shape
      }
     )
@@ -284,7 +330,7 @@ shinyServer(
     ####### recherche du système de projection cible pour le fond de carte fourni ####### 
     epsgCible <- eventReactive(input$inputFiles, 
      {
-       cat("\n recherche du système de projection cible pour le fond de carte fourni \n")
+       trace(traceLevel, "recherche du système de projection cible pour le fond de carte fourni", "DEBUG")
        distances <- lapply(vCentroideZones, rgeos::gDistance, territoire())
        index <- which.min(distances)
        epsg <- vZonesEPSG[[index]]
@@ -292,10 +338,22 @@ shinyServer(
      }
    )                                  
     
+    ############ affichage du bouton Lisser ############
+    observeEvent(input$inputDatas,
+    {
+      if (is.null(input$inputDatas) | input$inputDatas == "") 
+        return(NULL)
+      
+      trace(traceLevel, "############ affichage du bouton Lisser ############", "DEBUG")
+      output$btnDynLisser <- renderUI({
+        actionButton(inputId = "btnDynLisser", label = "Lisser", class = "btn-primary")
+      })
+    })
+    
     ####### sélection base de données ######
     currentTable <- eventReactive(input$inputDatas, 
       {
-        cat("\n ############ sélection base de données ############\n")
+        trace(traceLevel, "############ sélection base de données ############", "DEBUG")
         if (is.null(input$inputDatas) | input$inputDatas == "")
           return(NULL)
 
@@ -333,21 +391,19 @@ shinyServer(
         listeColonnes <- fctReadProperty(paste0(getwd(), "/properties/", nomFichierConfSource), fields = c(cle))
         sRequete <- paste("select", listeColonnes, "from", vNomTables[1])
         sRequete <- paste(sRequete,  "where x >=", xMin, "and x <=", xMax, "and y >=", yMin, "and y<=", yMax)
-
-        log4r::info(logger, paste("Requête :", sRequete))
+        trace(traceLevel, paste("Requête :", sRequete))
         progress$set(value = 0.5, detail = 'Sélection des données correspondant au fond de carte')
 
         tryCatch({
           debutRequete <- Sys.time()
           dfBase <- DBI::dbGetQuery(cnxBDD, sRequete)
-          log4r::info(logger, paste0("Durée requête : ", round(Sys.time() - debutRequete), "s"))
+          trace(traceLevel, paste0("Durée requête : ", round(Sys.time() - debutRequete), "s\n"))
         }, warning = function(w) {
         }, error = function(e) {
           message <- paste("Erreur lors de la lecture de la table. Requete:", sRequete, e, sep = "\n")
-          log4r::error(logger, message)
+          trace(traceLevel, message, "ERROR")
           stop(message)
         }, finally = {
-          progress$set(value = 0, detail = pbDetailParDefaut)
           DBI::dbDisconnect(cnxBDD)
         })
 
@@ -361,23 +417,19 @@ shinyServer(
         { 
           message <- paste("Aucune donnée ne correspond à l'intersection données / fond de carte")
           session$sendCustomMessage(type = 'msgboxError', message = message)
-          log4r::warn(logger, message)
-
+          trace(message, "WARN")
+          
           # TODO: supprimer le bouton lisser
           return(NULL)
         }
         
-        output$btnDynLisser <- renderUI({
-          actionButton(inputId = "btnDynLisser", label = "Lisser", class = "btn-primary")
-        })
-
         dfBase
       }
     )
     
     ####### lissage des données #######
     dfLisse <- eventReactive(input$btnDynLisser, {
-      cat("\n ############ lissage des données ############\n")
+      trace(traceLevel, "############ lissage des données ############", "DEBUG")
       if (is.null(input$btnDynLisser))
        return(NULL)
      
@@ -389,64 +441,54 @@ shinyServer(
                                       , cellSize = input$pas
                                       , bandwidth = input$sliderRayon
                                       , fUpdateProgress = updateProgress)
-        log4r::info(logger, paste0("Durée lissage : ", round(Sys.time() - debutLissage), "s"))
+        trace(traceLevel, paste0("Durée lissage : ", round(Sys.time() - debutLissage), "s"))
         
-        nbObsAvantElagage <- length(dfLisse$nbObsLisse)
+        nbObsAvantElagage <- nrow(dfLisse)
         dfLisse <- dfLisse[dfLisse$nbObsLisse >= NB_OBS_MIN, ]
-        log4r::info(logger, paste("Elagage pour secret - nb carreaux supprimés:", nbObsAvantElagage - length(dfLisse$nbObsLisse), "- avant :", nbObsAvantElagage, "- après:", length(dfLisse$nbObsLisse), "- seuil:", NB_OBS_MIN, "obs - nb obs min:", min(dfLisse$nbObsLisse), "- nb obs max:", max(dfLisse$nbObsLisse)))
+        trace(traceLevel, paste("Elagage pour secret - nb carreaux supprimés:", nbObsAvantElagage - nrow(dfLisse), "- avant :", nbObsAvantElagage, "- après:", nrow(dfLisse), "- seuil:", NB_OBS_MIN, "obs - nb obs min:", min(dfLisse$nbObsLisse), "- nb obs max:", max(dfLisse$nbObsLisse)))
         
        # traitement post-lissage
         nomSource <- strsplit(as.character(input$inputDatas[1]), "/")[[1]][2]
         millesime <- strsplit(as.character(input$inputDatas[1]), "/")[[1]][3]
         cle <- paste0(nomSource, ".", millesime, ".traitementPostLissage")
         instructions <- fctReadProperty(paste0(getwd(), "/properties/", nomFichierConfSource), fields = c(cle))
+        instructions <- gsub(pattern = "\t", replacement = "", x = instructions)
 
        tryCatch({
          debutPostLissage <- Sys.time()
          eval(parse(text = instructions))
-         log4r::info(logger, paste0("Durée post-lissage : ", round(Sys.time() - debutPostLissage), "s"))
+         trace(traceLevel, paste0("Durée post-lissage : ", round(Sys.time() - debutPostLissage), "s"))
        }, warning = function(w) {
        }, error = function(e) {
          message <- paste("Erreur lors de l'évaluation du traitement post-lissage. Ce traitement sera ignoré.\n", instructions, e, sep = "\n")
          session$sendCustomMessage(type = 'msgboxError', message = message)
-          log4r::error(logger, message)
+         trace(traceLevel, message, "ERROR")
        }, finally = {
        })
-       
-       dfLisse
-    }
-    )
-
-    ####### affichage de la liste de sélection pour la carte #######
-    output$selectVar <- renderUI({
-      cat("\n ############ affichage de la liste de sélection pour la carte ############\n")
-      if (is.null(currentTable()) | is.null(dfLisse()))
-        return(NULL)
-
-      listeColonnes <- setdiff(colnames(dfLisse()), c("x", "y"))
-      fluidRow( selectInput(inputId = "selectVar", label = "", choices = listeColonnes))
+        
+      dfLisse
     })
 
     ####### affichage et traitement du bouton download #######
-    observeEvent(input$selectVar,
+    observeEvent(input$btnDynLisser,
      {
-       cat("\n ############ affichage et traitement du bouton download ############\n")
+       trace(traceLevel, "############ affichage et traitement du bouton download ############", "DEBUG")
        output$btnDownload <- downloadHandler(
         filename = function() { 
-            # cat("\n ############ filename download ############\n")
+            trace(traceLevel, "############ filename download ############", "DEBUG")
             fond <- strsplit(basename(input$inputFiles[1, 1]), "\\.")[[1]][1]
             source <- as.character(input$inputDatas[1])
             source <- gsub("/", "_", source)
             pas <- input$pas
             rayon <- input$sliderRayon
-            var <- input$selectVar
-            nomArchiveSansExt <- paste(fond, source, pas, rayon, var, sep = '_') 
+            nomArchiveSansExt <- paste(fond, source, pas, rayon, sep = '_') 
             nomArchiveAvecExt <- paste0(nomArchiveSansExt, ".zip") 
-            log4r::info(logger, paste("Téléchargement de ", nomArchiveAvecExt))
+            trace(traceLevel, paste("Téléchargement de", nomArchiveAvecExt))
             nomArchiveAvecExt
         },
         content = function(file) {
-          # cat("\n ############ content download ############\n")
+          trace(traceLevel, "############ content download ############", "DEBUG")
+          progress$set(value = 0.2, detail = "Préparation du téléchargement")
           dfLisse <- dfLisse()
           fond <- strsplit(basename(input$inputFiles[1, 1]), "\\.")[[1]][1]
           source <- as.character(input$inputDatas[1])
@@ -471,29 +513,35 @@ shinyServer(
           setwd(repCouche)
           filePathNameLayer <- paste0(repCouche, "/", nomArchiveSansExt, ".shp")
           
-          # Remarque: on effectue un nouveau smoothingToGrid car on veut les carreaux éliminés par l'élagage de performance
-          grid = btb::smoothingToGrid(grid = dfLisse, epsg = epsgCible(), fUpdateProgress = updateProgress)
-          progress$set(value = 0, detail = pbDetailParDefaut)
-          rgdal::writeOGR(grid, filePathNameLayer, nomVariableCourante, driver = "ESRI Shapefile", overwrite_layer = "TRUE")
-
+          progress$set(value = 0.4, detail = "Préparation de la grille")
+          rgdal::writeOGR(grille(), filePathNameLayer, nomVariableCourante, driver = "ESRI Shapefile", overwrite_layer = "TRUE")
+          
+          progress$set(value = 0.6, detail = "Préparation des données")
           save(dfLisse, file = paste0(repCouche, "/", nomArchiveSansExt, ".RData"))
           liste_export <- paste0(nomArchiveSansExt, c(".dbf", ".shp", ".shx", ".prj", ".RData"))
           
+          progress$set(value = 0.8, detail = "Compression des données")
           archiveZip <- zip(zipfile = file, files = liste_export)
           setwd(repTravailSauve)
           unlink(c(repCouche), recursive = TRUE)
+          trace(traceLevel, paste("Téléchargement - Taille du zip :", round(file.info(file)[, "size"]/1024), "Ko"), "INFO")
+
+          progress$set(value = 0, detail = pbDetailParDefaut)
           archiveZip
           },
-        contentType = "application/zip"
+          contentType = "application/zip"
        )
-       output$avertissement <- renderUI({div("Attention ! Veillez à respecter le secret statistique avant toute diffusion.", style = "color:red")})
-       output$telecharger <- renderUI({downloadButton('btnDownload', 'Télécharger')})
+       output$avertissement <- renderUI({div("Veillez à respecter le secret statistique avant diffusion.", style = "color:red")})
+       
+       # la version avec le javascript "onclick" fonctionne en local mais pas en recette, vraisemblablement à cause d'une différence sur la version du package shiny (comme pour aspect e la barre de progression)
+       # output$telecharger <- renderUI({downloadButton(outputId = 'btnDownload', label = 'Télécharger', onclick = "return confirm('Je reconnais avoir lu et accepté les règles indiquées dans l onglet Secret statistique.');")})
+       output$telecharger <- renderUI({downloadButton(outputId = 'btnDownload', label = 'Télécharger')})
       }
     )
 
     ####### affichage des paramètres de lissage utilisés #######
     observeEvent(input$carteAffichee, {
-                           cat("############ retour du serveur via javascript ############")
+     trace(traceLevel, "############ retour du serveur via javascript ############", "DEBUG")
       if ( is.null(input$selectVar) )
         return(NULL)
       progress$set(value = 0, detail = pbDetailParDefaut)
@@ -506,40 +554,75 @@ shinyServer(
      message <- paste(message, "<br>Min obs par carreau: \t<b>", NB_OBS_MIN, "</b>")
      message <- paste(message, "<br>Max carreaux affichés:\t<b>", NB_MAX_CARREAUX, "</b>")
      
-     log4r::info(logger, paste("Paramètres lissage - carte:", strsplit(basename(input$inputFiles[1, 1]), "\\.")[[1]][1], "- Source:", as.character(input$inputDatas[1]), "- pas:", input$pas, "- rayon:", input$sliderRayon))
+     trace(traceLevel, paste("Paramètres lissage - carte:", strsplit(basename(input$inputFiles[1, 1]), "\\.")[[1]][1], "- Source:", as.character(input$inputDatas[1]), "- pas:", input$pas, "- rayon:", input$sliderRayon))
      output$parametresUtilises <- renderUI({HTML(message)})
     })
     
-    ####### calcul de la grille élaguée #######
-    grilleElaguee <- reactive({
-      cat("\n ############ calcul de la grille élaguee ############\n")
+    ####### calcul de la grille #######
+    grille <- reactive({
+      trace(traceLevel, "############ calcul de la grille ############", "DEBUG")
       dfLisse <- dfLisse()
-      nbCarreauxAvantElagage <- length(dfLisse$nbObsLisse)
-      if (length(dfLisse$nbObsLisse) > NB_MAX_CARREAUX)
-      {
-        vNbObsTrie <- sort(dfLisse$nbObsLisse, decreasing = TRUE)
-        iLimite <- vNbObsTrie[NB_MAX_CARREAUX]
-        dfLisse <- dfLisse[dfLisse$nbObsLisse >= iLimite, ]
-      }
-      log4r::info(logger, paste("Elagage pour performance - nb carreaux supprimés:", nbCarreauxAvantElagage - length(dfLisse$nbObsLisse), "- avant :", nbCarreauxAvantElagage, "- après:", length(dfLisse$nbObsLisse), "- seuil:", NB_MAX_CARREAUX, "carreaux - nb Obs min:", min(dfLisse$nbObsLisse), "- nb Obs max:", max(dfLisse$nbObsLisse)))
+
+      # création de la grille
+      grille <- btb::smoothingToGrid(grid = dfLisse, epsg = epsgCible(), fUpdateProgress = updateProgress)   # L93
       
-      grilleElaguee <- btb::smoothingToGrid(grid = dfLisse, epsg = epsgCible(), fUpdateProgress = updateProgress)   # L93
-      grilleElaguee
+      # Ne conserver que les carreaux réellement dans le territoire étudié
+      nbCarreauxAvantElagageSecret <- nrow(grille)
+      coucheTerritoire <- sp::spTransform(territoire(), CRSobj = CRS(paste0("+init=epsg:", epsgCible())))
+      grille <- grille[coucheTerritoire, ]
+      
+      trace(traceLevel, paste0("Nb carreaux entre territoire et rectangle englobant: ", nbCarreauxAvantElagageSecret - nrow(grille)), "INFO")
+      
+      grille
     })
     
+    ####### affichage de la liste de sélection pour la carte #######
+    observeEvent(grille(),{
+      trace(traceLevel, "############ affichage de la liste de sélection pour la carte ############", "DEBUG")
+      listeColonnes <- setdiff(colnames(dfLisse()), c("x", "y", "nbObsLisse"))
+      output$selectVar <- renderUI({fluidRow( selectInput(inputId = "selectVar", label = NULL, choices = listeColonnes))})
+    })
+
     ####### affichage de la carte WSG84 #######
     output$map <- renderLeaflet({
-      cat("\n ############ affichage de la carte WSG84 ############\n")
+      # observeEvent(input$selectVar, {
+      trace(traceLevel, "############ affichage de la carte WSG84 ############", "DEBUG")
+
       if ( is.null(input$selectVar) )
         return(NULL)
+      
+      fond <- grille()   # L93
+      
+      # Elagage pour performances d'affichage
+      progress$set(value = 0.05, detail = "élagage pour performance d'affichage")
+      if ("nbObsLisse" %in% colnames(fond@data))
+      {
+        nbCarreauxAvantElagage <- nrow(fond)
+        if (nbCarreauxAvantElagage > NB_MAX_CARREAUX)
+        {
+          fond <- fond[with(fond@data, order(-nbObsLisse)), ]
+          limiteNbObs <- fond$nbObsLisse[NB_MAX_CARREAUX]
+          fond <- fond[fond$nbObsLisse >= limiteNbObs, ]
+          trace(traceLevel, paste("Elagage pour performance - nb carreaux supprimés:", nbCarreauxAvantElagage - nrow(fond), "- avant :", nbCarreauxAvantElagage, "- après:", nrow(fond), "- seuil:", NB_MAX_CARREAUX, "carreaux - nb Obs min:", min(fond$nbObsLisse), "- nb Obs max:", max(fond$nbObsLisse)))
+        }
+      }
+      else
+      {
+        trace(traceLevel, "Pas d'élagage de performance car colonne nbObsLisse non trouvée.", "WARNING")
+      }
 
       progress$set(value = 0.10, detail = "Préparation de la couche lissée")
-      fond <- grilleElaguee()   # L93
       fond <- spTransform(fond, CRS = CRS("+init=epsg:4326")) # transformation en WGS84 pour le leaflet
-      # territoire <- spTransform(territoire(), CRS = CRS("+init=epsg:4326")) # transformation en WGS84 pour le leaflet
 
       progress$set(value = 0.20, detail = "Préparation catégories")
       variable <- paste0("fond@data$", input$selectVar)
+      
+      # pour supprimer les cases dont le calcul a donné des valeurs non représentables (comme un sex ratio infini si n hommes / 0 femme)
+      nbCasesAvant <- nrow(fond)
+      fond <- fond[(eval(parse(text = variable))) != -Inf & (eval(parse(text = variable))) != Inf, ]
+      if(nrow(fond) < nbCasesAvant)
+        trace(traceLevel, paste(nbCasesAvant - nrow(fond), "cases supprimées car non représentables pour la variable", input$selectVar), niveau = "WARNING")
+      
       classeIntervalles <- classInt::classIntervals(eval(parse(text = variable)), style = "kmeans", n = 5)
       fond@data$colonneCouleurs <- findColours(classeIntervalles, vNuancesRouge)
 
@@ -549,44 +632,80 @@ shinyServer(
       coucheQPV <- coucheQPVMetropole[fond, ]
 
       bboxshp <- bbox(fond)
-      xMin <- bboxshp[1, 1]
-      xMax <- bboxshp[1, 2]
-      yMin <- bboxshp[2, 1]
-      yMax <- bboxshp[2, 2]
+      xMin <- bboxshp["x", "min"]
+      xMax <- bboxshp["x", "max"]
+      yMin <- bboxshp["y", "min"]
+      yMax <- bboxshp["y", "max"]
       
       borneInfCategorie <- round(classeIntervalles$brks[1:(length(classeIntervalles$brks) - 1)])
       borneSupCategorie <- round(classeIntervalles$brks[2:length(classeIntervalles$brks)])
       labelCategories <- paste(borneInfCategorie, "-", borneSupCategorie)
       
+      # masquer les bornes extrêmes
+      labelCategories[1] <- gsub(paste0(strsplit(labelCategories[1], " - ")[[1]][1], " - "), "- de ", labelCategories[1])
+      labelCategories[length(classeIntervalles$brks) - 1] <- gsub(paste0(" - ", strsplit(labelCategories[length(classeIntervalles$brks) - 1], " - ")[[1]][2]), "", labelCategories[length(classeIntervalles$brks) - 1])
+      labelCategories[length(classeIntervalles$brks) - 1] <- paste0("+ de ", labelCategories[length(classeIntervalles$brks) - 1])
+
       heureDebut <- Sys.time()
       progress$set(value = 0.60, detail = "Préparation de la carte")
       carte <-
-        leaflet() %>% addTiles(urlTemplate = urlFondDeCarte)  %>%
-          fitBounds(xMin, yMin, xMax, yMax) %>%
-          # addRectangles(lng1 = xMin, lat1 = yMin, lng2 = xMax, lat2 = yMax, fill = FALSE, weight = 3) %>%
-          addPolygons(data = fond, fillColor = ~colonneCouleurs, stroke = FALSE, smoothFactor = 1, fillOpacity = 0.7) %>%
-          addPolygons(data = coucheQPV, stroke = TRUE, smoothFactor = 1, fillOpacity = 0, color = "black", weight = 1, opacity = 1) %>%
-          addPolygons(data = territoire(), weight = 3, color = "black", opacity = 1, fillOpacity = 0) %>%
-          addLegend(colors = vNuancesRouge, values = eval(parse(text = variable)), position = "bottomleft", title = "Catégories", labels = labelCategories, opacity = 0.7)
+        leaflet() %>% fitBounds(xMin, yMin, xMax, yMax) %>%
+        # addRectangles(lng1 = xMin, lat1 = yMin, lng2 = xMax, lat2 = yMax, fill = FALSE, weight = 3) %>%
+        addPolygons(data = fond, fillColor = ~colonneCouleurs, stroke = FALSE, fillOpacity = 0.7) %>%
+        addPolygons(data = coucheQPV, fillOpacity = 0, color = "black", weight = 1, opacity = 1) %>%
+        addPolygons(data = territoire(), weight = 3, color = "black", opacity = 1, fillOpacity = 0) %>%
+        addLegend(colors = vNuancesRouge, values = eval(parse(text = variable)), position = "bottomleft", title = "Catégories", labels = labelCategories, opacity = 0.7)
+      
+      isolate(
+      if (input$afficheOSM == TRUE)
+        carte <- carte %>% addTiles(urlTemplate = urlFondDeCarte) %>% addTiles()
+      )
       
       # pour conserver le niveau de zoom et la position de la carte
       isolate(
-        if (!is.null((input$map_zoom)) & !is.null(input$map_bounds))
+        if (input$conserverZoom == "TRUE")
         {
-          xMinZoom <- input$map_bounds$west
-          xMaxZoom <- input$map_bounds$east
-          yMinZoom <- input$map_bounds$south
-          yMaxZoom <- input$map_bounds$north
-          xCenter <- (xMaxZoom + xMinZoom) / 2
-          yCenter <- (yMaxZoom + yMinZoom) / 2
-          carte <- carte %>% setView(lng = xCenter, lat = yCenter, zoom = input$map_zoom)
+          if (!is.null((input$map_zoom)) & !is.null(input$map_bounds))
+          {
+            xMinZoom <- input$map_bounds$west
+            xMaxZoom <- input$map_bounds$east
+            yMinZoom <- input$map_bounds$south
+            yMaxZoom <- input$map_bounds$north
+            xCenter <- (xMaxZoom + xMinZoom) / 2
+            yCenter <- (yMaxZoom + yMinZoom) / 2
+            carte <- carte %>% setView(lng = xCenter, lat = yCenter, zoom = input$map_zoom)
+          }
         }
       )
       
-      log4r::info(logger, paste0("Durée préparation carte : ", round(Sys.time() - heureDebut), "s"))
+      trace(traceLevel, paste0("Durée préparation carte : ", round(Sys.time() - heureDebut), "s"), "DEBUG")
       progress$set(value = 0.80, detail = "Préparation de l'affichage par votre navigateur")
 
+      debutGC <- Sys.time()
+      gc()
+      trace(traceLevel, paste("durée gc() :", Sys.time() - debutGC), "DEBUG")
+      trace(traceLevel, paste("object.size(carte) :", round(object.size(carte) / 1048576, digits = 3), "Mo"), "DEBUG")
+      trace(traceLevel, paste("memory.size() :", memory.size(), "Mo"), "DEBUG")
+      trace(traceLevel, paste("memory.limit() :", memory.limit(), "Mo"), "DEBUG")
+
+      # output$map <- renderLeaflet({carte})
       carte
     })
+ 
+    ####### affichage de la couche openStreetMap
+    observeEvent(input$afficheOSM, {
+        if (input$afficheOSM == TRUE)
+        {
+          leafletProxy("map")  %>% addTiles(urlTemplate = urlFondDeCarte)  %>%
+            addTiles()
+        }
+        else
+        {
+          leafletProxy("map") %>%
+            clearTiles()
+        }
+      }
+    )
+
   }
 )
